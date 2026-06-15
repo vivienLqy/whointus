@@ -39,7 +39,8 @@ function sanitizeLobby(lobby) {
       pseudo: p.pseudo,
       ready: p.ready,
       isHost: p.id === lobby.host,
-      team: p.team
+      team: p.team,
+      disconnected: p.disconnected || false
     })),
     votes: lobby.phase === 'vote' ? lobby.votes : undefined,
     result: lobby.result,
@@ -115,6 +116,31 @@ wsServer.on('connection', (ws) => {
         lobby.players.push(player);
         ws.lobbyCode = msg.code;
         ws.send(JSON.stringify({ type: 'joined', code: msg.code, playerId: ws.playerId }));
+        broadcastLobby(msg.code);
+        break;
+      }
+
+      case 'rejoin_lobby': {
+        const lobby = lobbies[msg.code];
+        if (!lobby) {
+          ws.send(JSON.stringify({ type: 'error', code: 'LOBBY_NOT_FOUND', msg: 'Lobby introuvable.' }));
+          return;
+        }
+        const player = lobby.players.find(p => p.id === msg.playerId);
+        if (!player) {
+          ws.send(JSON.stringify({ type: 'error', code: 'PLAYER_NOT_FOUND', msg: 'Joueur introuvable dans ce lobby.' }));
+          return;
+        }
+        // Annuler le timer de suppression
+        if (player._reconnectTimer) {
+          clearTimeout(player._reconnectTimer);
+          player._reconnectTimer = null;
+        }
+        // Rattacher la nouvelle socket au joueur existant
+        player.ws = ws;
+        player.disconnected = false;
+        ws.playerId = msg.playerId;
+        ws.lobbyCode = msg.code;
         broadcastLobby(msg.code);
         break;
       }
@@ -230,15 +256,31 @@ wsServer.on('connection', (ws) => {
   ws.on('close', () => {
     const code = ws.lobbyCode;
     if (!code || !lobbies[code]) return;
-    lobbies[code].players = lobbies[code].players.filter(p => p.id !== ws.playerId);
-    if (lobbies[code].players.length === 0) {
-      delete lobbies[code];
-    } else {
-      if (lobbies[code].host === ws.playerId) {
-        lobbies[code].host = lobbies[code].players[0].id;
+    const lobby = lobbies[code];
+    const player = lobby.players.find(p => p.id === ws.playerId);
+    if (!player) return;
+
+    // On marque le joueur comme déconnecté sans le supprimer tout de suite.
+    // Il a 10 secondes pour se reconnecter via rejoin_lobby.
+    player.disconnected = true;
+    player.ws = null;
+
+    player._reconnectTimer = setTimeout(() => {
+      // Toujours déconnecté après le délai → on le retire pour de bon
+      if (!lobbies[code]) return;
+      lobby.players = lobby.players.filter(p => p.id !== ws.playerId);
+      if (lobby.players.length === 0) {
+        delete lobbies[code];
+      } else {
+        if (lobby.host === ws.playerId) {
+          lobby.host = lobby.players[0].id;
+        }
+        broadcastLobby(code);
       }
-      broadcastLobby(code);
-    }
+    }, 30000);
+
+    // On broadcast quand même pour signaler la déco temporaire aux autres
+    broadcastLobby(code);
   });
 });
 
